@@ -1,0 +1,19 @@
+apiVersion: kubeadm.weisnix.org/v1alpha1
+kind: Cluster
+metadata:
+  name: vagrant
+spec:
+  controllers:
+    - name: controller01
+      ip: 192.168.10.2
+    - name: controller02
+      ip: 192.168.10.3
+    - name: controller03
+      ip: 192.168.10.4
+  workers:
+    - name: worker01
+      ip: 192.168.10.5
+    - name: worker02
+      ip: 192.168.10.6
+    - name: worker03
+      ip: 192.168.10.7

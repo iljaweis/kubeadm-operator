@@ -1,0 +1,313 @@
+package cluster
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	kubeadmv1alpha1 "github.com/iljaweis/kubeadm-operator/pkg/apis/kubeadm/v1alpha1"
+	resourcesv1alpha1 "github.com/iljaweis/resource-ctlr/pkg/apis/resources/v1alpha1"
+	pkgerrors "github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+)
+
+var log = logf.Log.WithName("controller_cluster")
+
+// Add creates a new Cluster Controller and adds it to the Manager. The Manager will set fields on the Controller
+// and Start it when the Manager is Started.
+func Add(mgr manager.Manager) error {
+	return add(mgr, newReconciler(mgr))
+}
+
+// newReconciler returns a new reconcile.Reconciler
+func newReconciler(mgr manager.Manager) reconcile.Reconciler {
+	return &ReconcileCluster{
+		client:   mgr.GetClient(),
+		scheme:   mgr.GetScheme(),
+		recorder: mgr.GetRecorder("kubeadm-operator"),
+	}
+}
+
+// add adds a new Controller to mgr with r as the reconcile.Reconciler
+func add(mgr manager.Manager, r reconcile.Reconciler) error {
+	// Create a new controller
+	c, err := controller.New("cluster-controller", mgr, controller.Options{Reconciler: r})
+	if err != nil {
+		return err
+	}
+
+	// Watch for changes to primary resource Cluster
+	err = c.Watch(&source.Kind{Type: &kubeadmv1alpha1.Cluster{}}, &handler.EnqueueRequestForObject{})
+	if err != nil {
+		return err
+	}
+
+	if err := c.Watch(&source.Kind{Type: &resourcesv1alpha1.Command{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &kubeadmv1alpha1.Cluster{},
+	}); err != nil {
+		return err
+	}
+
+	if err := c.Watch(&source.Kind{Type: &resourcesv1alpha1.File{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &kubeadmv1alpha1.Cluster{},
+	}); err != nil {
+		return err
+	}
+
+	if err := c.Watch(&source.Kind{Type: &resourcesv1alpha1.FileContent{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &kubeadmv1alpha1.Cluster{},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+var _ reconcile.Reconciler = &ReconcileCluster{}
+
+// ReconcileCluster reconciles a Cluster object
+type ReconcileCluster struct {
+	// This client, initialized using mgr.Client() above, is a split client
+	// that reads objects from the cache and writes to the apiserver
+	client   client.Client
+	scheme   *runtime.Scheme
+	recorder record.EventRecorder
+}
+
+// Reconcile reads that state of the cluster for a Cluster object and makes changes based on the state read
+// and what is in the Cluster.Spec
+// The Controller will requeue the Request to be processed again if the returned error is non-nil or
+// Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
+func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Result, error) {
+	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
+	reqLogger.Info("Reconciling Cluster")
+
+	cluster := &kubeadmv1alpha1.Cluster{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, cluster)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
+	}
+
+	update := false
+
+	if err := r.ensureHosts(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "error ensuring target host resources")
+	}
+
+	if err := r.ensureKubeadmConfig(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not create kubeadm config")
+	}
+
+	if err := r.ensureAdminConf(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not fetch and store admin.conf")
+	}
+
+	if err := r.ensurePKIStatus(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not set PKI status")
+	}
+
+	if update {
+		if err := r.client.Status().Update(context.TODO(), cluster); err != nil {
+			return reconcile.Result{}, pkgerrors.Wrapf(err, "could not update cluster status for %s", request)
+		}
+
+		return reconcile.Result{}, nil
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileCluster) ensureHosts(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+
+	for _, co := range cluster.Spec.Controllers {
+		if err := r.ensureHost(cluster, co, update); err != nil {
+			return err
+		}
+	}
+
+	for _, wo := range cluster.Spec.Workers {
+		if err := r.ensureHost(cluster, wo, update); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *ReconcileCluster) ensureHost(cluster *kubeadmv1alpha1.Cluster, chost kubeadmv1alpha1.ClusterMember, update *bool) error {
+
+	host := &resourcesv1alpha1.Host{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: chost.Name}, host)
+	if err != nil && !errors.IsNotFound(err) {
+		return pkgerrors.Wrapf(err, "could not get host object for %s", chost.Name)
+	}
+
+	if err != nil { // not found
+		host := &resourcesv1alpha1.Host{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      chost.Name,
+			},
+			Spec: resourcesv1alpha1.HostSpec{
+				IPAddress:    chost.IP,
+				SshKeySecret: cluster.Spec.DefaultSSHKeySecret,
+				Port:         22,
+			},
+		}
+
+		_ = controllerutil.SetControllerReference(cluster, host, r.scheme) // cannot fail
+
+		if err := r.client.Create(context.TODO(), host); err != nil {
+			return pkgerrors.Wrapf(err, "could not create host object for %s", chost.Name)
+		}
+
+		return nil
+	}
+
+	return nil
+}
+
+func (r *ReconcileCluster) ensureKubeadmConfig(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+
+	if cluster.Status.KubeadmConfig != nil {
+		return nil
+	}
+
+	cluster.Status.KubeadmConfig = &kubeadmv1alpha1.ClusterConfiguration{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ClusterConfiguration",
+			APIVersion: "kubeadm.k8s.io/v1beta1",
+		},
+	}
+
+	*update = true
+
+	return nil
+}
+
+func ParseKubeadmOutput(in string) (string, string) {
+	re := regexp.MustCompile("--token (\\S+)\\s*--discovery-token-ca-cert-hash\\s*(\\S+)\\s*$")
+	ar := re.FindStringSubmatch(in)
+	fmt.Printf("+%q\n", ar)
+	if len(ar) == 3 {
+		return ar[1], ar[2]
+	}
+	return "", ""
+}
+
+func (r *ReconcileCluster) ensureAdminConf(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+	name := cluster.Name + "-adminconf"
+	fc := &resourcesv1alpha1.FileContent{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, fc)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	if err != nil {
+		fc := &resourcesv1alpha1.FileContent{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      name,
+			},
+			Spec: resourcesv1alpha1.FileContentSpec{
+				Host: cluster.Spec.Controllers[0].Name,
+				Path: "/etc/kubernetes/admin.conf",
+				Requires: &resourcesv1alpha1.Requires{{
+					Command: &resourcesv1alpha1.RequireCommand{
+						Name: cluster.Name + "-" + "kubeadm-init"},
+				}},
+			},
+		}
+		if err := r.client.Create(context.TODO(), fc); err != nil {
+			return err
+		}
+	} else {
+		if fc.Status.Done {
+			if cluster.Status.AdminConf != fc.Status.Content {
+				cluster.Status.AdminConf = fc.Status.Content
+				*update = true
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *ReconcileCluster) ensurePKIStatus(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+	pkifiles := map[string]string{
+		"cacert":         "/etc/kubernetes/pki/ca.crt",
+		"cakey":          "/etc/kubernetes/pki/ca.key",
+		"sakey":          "/etc/kubernetes/pki/sa.key",
+		"sapub":          "/etc/kubernetes/pki/sa.pub",
+		"frontproxykey":  "/etc/kubernetes/pki/front-proxy-ca.key",
+		"frontproxycert": "/etc/kubernetes/pki/front-proxy-ca.crt",
+		"etcdcert":       "/etc/kubernetes/pki/etcd/ca.crt",
+		"etcdkey":        "/etc/kubernetes/pki/etcd/ca.key",
+	}
+
+	pkifields := map[string]*string{
+		"cacert":         &cluster.Status.PKI.CACert,
+		"cakey":          &cluster.Status.PKI.CAKey,
+		"sakey":          &cluster.Status.PKI.SAPrivate,
+		"sapub":          &cluster.Status.PKI.SAPublic,
+		"frontproxykey":  &cluster.Status.PKI.FrontProxyKey,
+		"frontproxycert": &cluster.Status.PKI.FrontProxyCert,
+		"etcdcert":       &cluster.Status.PKI.EtcdCert,
+		"etcdkey":        &cluster.Status.PKI.EtcdKey,
+	}
+
+	for k, _ := range pkifields {
+		fcname := fmt.Sprintf("%s-pki-%s", cluster.Name, k)
+		fc := &resourcesv1alpha1.FileContent{}
+		err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: fcname}, fc)
+		if err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+		if err != nil {
+			fc := &resourcesv1alpha1.FileContent{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: cluster.Namespace,
+					Name:      fcname,
+				},
+				Spec: resourcesv1alpha1.FileContentSpec{
+					Host: cluster.Spec.Controllers[0].Name,
+					Path: pkifiles[k],
+					Requires: &resourcesv1alpha1.Requires{{
+						Command: &resourcesv1alpha1.RequireCommand{
+							Name: cluster.Name + "-" + "kubeadm-init"},
+					}},
+				},
+			}
+			if err := r.client.Create(context.TODO(), fc); err != nil {
+				return err
+			}
+		} else {
+			if fc.Status.Done {
+				if *pkifields[k] != fc.Status.Content {
+					*pkifields[k] = fc.Status.Content
+					*update = true
+				}
+			}
+		}
+	}
+
+	return nil
+}
