@@ -3,6 +3,9 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"github.com/ghodss/yaml"
+	"github.com/go-logr/logr"
+	"reflect"
 	"regexp"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -95,8 +98,8 @@ type ReconcileCluster struct {
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
-	reqLogger.Info("Reconciling Cluster")
+	logger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
+	logger.Info("Reconciling Cluster")
 
 	cluster := &kubeadmv1alpha1.Cluster{}
 	err := r.client.Get(context.TODO(), request.NamespacedName, cluster)
@@ -113,8 +116,12 @@ func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, pkgerrors.Wrap(err, "error ensuring target host resources")
 	}
 
-	if err := r.ensureKubeadmConfig(cluster, &update); err != nil {
+	if err := r.ensureKubeadmConfig(logger, cluster, &update); err != nil {
 		return reconcile.Result{}, pkgerrors.Wrap(err, "could not create kubeadm config")
+	}
+
+	if err := r.runKubeadmOnFirstController(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not run initial kubeadm")
 	}
 
 	if err := r.ensureAdminConf(cluster, &update); err != nil {
@@ -186,20 +193,46 @@ func (r *ReconcileCluster) ensureHost(cluster *kubeadmv1alpha1.Cluster, chost ku
 	return nil
 }
 
-func (r *ReconcileCluster) ensureKubeadmConfig(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+func nameForKubeadmConfigFile(cluster *kubeadmv1alpha1.Cluster) string {
+	return cluster.Name + "-kubeadm-config"
+}
 
-	if cluster.Status.KubeadmConfig != nil {
-		return nil
-	}
+func (r *ReconcileCluster) ensureKubeadmConfig(logger logr.Logger, cluster *kubeadmv1alpha1.Cluster, update *bool) error {
 
-	cluster.Status.KubeadmConfig = &kubeadmv1alpha1.ClusterConfiguration{
+	name := nameForKubeadmConfigFile(cluster)
+
+	kubeadmConfig := &kubeadmv1alpha1.ClusterConfiguration{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "ClusterConfiguration",
 			APIVersion: "kubeadm.k8s.io/v1beta1",
 		},
 	}
 
-	*update = true
+	if !reflect.DeepEqual(kubeadmConfig, cluster.Status.KubeadmConfig) {
+		cluster.Status.KubeadmConfig = kubeadmConfig
+		*update = true
+	}
+
+	var newConfig string
+
+	if b, err := yaml.Marshal(cluster.Status.KubeadmConfig); err != nil {
+		return pkgerrors.Wrapf(err, "could not encode kubeadm-config.yaml")
+	} else {
+		newConfig = string(b)
+	}
+
+	file := &resourcesv1alpha1.File{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: name}}
+	op, err := controllerutil.CreateOrUpdate(context.TODO(), r.client, file, func(e runtime.Object) error {
+		f := e.(*resourcesv1alpha1.File)
+		f.Spec.Host = cluster.Spec.Controllers[0].Name
+		f.Spec.Path = "/root/kubeadm-config.yaml"
+		f.Spec.Content = newConfig
+		return nil
+	})
+	if err != nil {
+		return pkgerrors.Wrapf(err, "could not reconcile file %s/%s", cluster.Namespace, name)
+	}
+	log.Info(fmt.Sprintf("reconciled File %s/%s operation %s", cluster.Namespace, name, op))
 
 	return nil
 }
@@ -246,6 +279,38 @@ func (r *ReconcileCluster) ensureAdminConf(cluster *kubeadmv1alpha1.Cluster, upd
 				*update = true
 			}
 		}
+	}
+
+	return nil
+}
+
+func (r *ReconcileCluster) runKubeadmOnFirstController(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+	name := cluster.Name + "-kubeadmin-" + cluster.Spec.Controllers[0].Name
+	cmd := &resourcesv1alpha1.FileContent{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, cmd)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	if err != nil {
+		fc := &resourcesv1alpha1.Command{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: cluster.Namespace,
+				Name:      name,
+			},
+			Spec: resourcesv1alpha1.CommandSpec{
+				Host:    cluster.Spec.Controllers[0].Name,
+				Command: "kubeadm init --config=/root/kubeadm-config.yaml",
+				Requires: &resourcesv1alpha1.Requires{{
+					File: &resourcesv1alpha1.RequireFile{
+						Name: cluster.Name + "-adminconf"},
+				}},
+			},
+		}
+		if err := r.client.Create(context.TODO(), fc); err != nil && !errors.IsAlreadyExists(err) { // TODO: ?!
+			return err
+		}
+
+		return nil
 	}
 
 	return nil
