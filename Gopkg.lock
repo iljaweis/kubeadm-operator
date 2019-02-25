@@ -222,11 +222,14 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:4eb7b10962265717e3a505c87d74a736a1b11f9b514a51acf0e40e9a528cdf64"
+  digest = "1:eed4da70141dc055d61355b3fb0d7912539bb45f3868cdfbe8d118a8f80b7f61"
   name = "github.com/iljaweis/resource-ctlr"
-  packages = ["pkg/apis/resources/v1alpha1"]
+  packages = [
+    "pkg/apis",
+    "pkg/apis/resources/v1alpha1",
+  ]
   pruneopts = "NT"
-  revision = "04a3331dfafa3e0db5a95ef91cc2064018ead6c6"
+  revision = "b62c2bbb511c5d2dfaca9769946c3079fe1ae6db"
 
 [[projects]]
   digest = "1:aaa38889f11896ee3644d77e17dc7764cc47f5f3d3b488268df2af2b52541c5f"
@@ -837,6 +840,8 @@
   analyzer-version = 1
   input-imports = [
     "github.com/ghodss/yaml",
+    "github.com/go-logr/logr",
+    "github.com/iljaweis/resource-ctlr/pkg/apis",
     "github.com/iljaweis/resource-ctlr/pkg/apis/resources/v1alpha1",
     "github.com/operator-framework/operator-sdk/pkg/k8sutil",
     "github.com/operator-framework/operator-sdk/pkg/leader",

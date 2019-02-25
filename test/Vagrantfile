@@ -1,0 +1,96 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# All Vagrant configuration is done below. The "2" in Vagrant.configure
+# configures the configuration version (we support older styles for
+# backwards compatibility). Please don't change it unless you know what
+# you're doing.
+Vagrant.configure("2") do |config|
+  config.vm.box = "centos/7"
+
+  config.vm.define "controller01" do |v|
+    v.vm.network :private_network, ip: "192.168.10.2"
+    v.vm.hostname = "controller01"
+
+    v.vm.provider :virtualbox do |vb|
+      vb.customize ["modifyvm", :id, "--memory", 2048]
+    end
+  end
+
+  config.vm.define "controller02" do |v|
+    v.vm.network :private_network, ip: "192.168.10.3"
+    v.vm.hostname = "controller02"
+
+    v.vm.provider :virtualbox do |vb|
+      vb.customize ["modifyvm", :id, "--memory", 2048]
+    end
+  end
+
+  config.vm.define "controller03" do |v|
+    v.vm.network :private_network, ip: "192.168.10.4"
+    v.vm.hostname = "controller03"
+
+    v.vm.provider :virtualbox do |vb|
+      vb.customize ["modifyvm", :id, "--memory", 2048]
+    end
+  end
+
+  config.vm.define "worker01" do |v|
+    v.vm.network :private_network, ip: "192.168.10.5"
+    v.vm.hostname = "worker01"
+
+    v.vm.provider :virtualbox do |vb|
+      vb.customize ["modifyvm", :id, "--memory", 2048]
+    end
+  end
+
+#  config.vm.define "worker02" do |v|
+#    v.vm.network :private_network, ip: "192.168.10.6"
+#
+#    v.vm.provider :virtualbox do |vb|
+#      vb.customize ["modifyvm", :id, "--memory", 2048]
+#    end
+#  end
+
+#  config.vm.define "worker03" do |v|
+#    v.vm.network :private_network, ip: "192.168.10.7"
+#
+#    v.vm.provider :virtualbox do |vb|
+#      vb.customize ["modifyvm", :id, "--memory", 2048]
+#    end
+#  end
+
+  $script = <<-SCRIPT
+sudo cp -fav /home/vagrant/.ssh /root/.ssh
+sudo chown -R root:root /root/.ssh
+
+yum install -y yum-utils device-mapper-persistent-data lvm2
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+yum install -y docker-ce docker-ce-cli containerd.io
+systemctl enable docker.service
+systemctl start docker.service
+
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+exclude=kube*
+EOF
+
+setenforce 0
+sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+
+systemctl enable --now kubelet
+swapoff /swapfile
+
+SCRIPT
+
+  config.vm.provision "shell", inline: $script
+
+end

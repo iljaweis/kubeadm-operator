@@ -1,0 +1,1 @@
+{"rsync":{"/vagrant":{"type":"rsync","guestpath":"/vagrant","hostpath":"/Users/iw/go/src/github.com/iljaweis/kubeadm-operator/test","disabled":false,"__vagrantfile":true,"owner":"vagrant","group":"vagrant"}}}

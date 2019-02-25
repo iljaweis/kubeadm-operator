@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"github.com/ghodss/yaml"
 	"github.com/go-logr/logr"
-	"reflect"
-	"regexp"
-
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kubeadmv1alpha1 "github.com/iljaweis/kubeadm-operator/pkg/apis/kubeadm/v1alpha1"
@@ -132,7 +131,17 @@ func (r *ReconcileCluster) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, pkgerrors.Wrap(err, "could not set PKI status")
 	}
 
+	if err := r.ensureTokenStatus(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not set token status")
+	}
+
+	if err := r.ensureNetworking(cluster, &update); err != nil {
+		return reconcile.Result{}, pkgerrors.Wrap(err, "could not set up networking")
+	}
+
 	if update {
+		fmt.Println("update is true")
+		logger.Info("updating Cluster status")
 		if err := r.client.Status().Update(context.TODO(), cluster); err != nil {
 			return reconcile.Result{}, pkgerrors.Wrapf(err, "could not update cluster status for %s", request)
 		}
@@ -181,7 +190,7 @@ func (r *ReconcileCluster) ensureHost(cluster *kubeadmv1alpha1.Cluster, chost ku
 			},
 		}
 
-		_ = controllerutil.SetControllerReference(cluster, host, r.scheme) // cannot fail
+		_ = controllerutil.SetControllerReference(cluster, host, r.scheme)
 
 		if err := r.client.Create(context.TODO(), host); err != nil {
 			return pkgerrors.Wrapf(err, "could not create host object for %s", chost.Name)
@@ -206,6 +215,7 @@ func (r *ReconcileCluster) ensureKubeadmConfig(logger logr.Logger, cluster *kube
 			Kind:       "ClusterConfiguration",
 			APIVersion: "kubeadm.k8s.io/v1beta1",
 		},
+		ControlPlaneEndpoint: cluster.Spec.Controllers[0].IP,
 	}
 
 	if !reflect.DeepEqual(kubeadmConfig, cluster.Status.KubeadmConfig) {
@@ -224,6 +234,9 @@ func (r *ReconcileCluster) ensureKubeadmConfig(logger logr.Logger, cluster *kube
 	file := &resourcesv1alpha1.File{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: name}}
 	op, err := controllerutil.CreateOrUpdate(context.TODO(), r.client, file, func(e runtime.Object) error {
 		f := e.(*resourcesv1alpha1.File)
+		if f.CreationTimestamp.IsZero() {
+			_ = controllerutil.SetControllerReference(cluster, f, r.scheme)
+		}
 		f.Spec.Host = cluster.Spec.Controllers[0].Name
 		f.Spec.Path = "/root/kubeadm-config.yaml"
 		f.Spec.Content = newConfig
@@ -232,19 +245,11 @@ func (r *ReconcileCluster) ensureKubeadmConfig(logger logr.Logger, cluster *kube
 	if err != nil {
 		return pkgerrors.Wrapf(err, "could not reconcile file %s/%s", cluster.Namespace, name)
 	}
-	log.Info(fmt.Sprintf("reconciled File %s/%s operation %s", cluster.Namespace, name, op))
+	if op != controllerutil.OperationResultNone {
+		log.Info(fmt.Sprintf("reconciled File %s/%s operation %s", cluster.Namespace, name, op))
+	}
 
 	return nil
-}
-
-func ParseKubeadmOutput(in string) (string, string) {
-	re := regexp.MustCompile("--token (\\S+)\\s*--discovery-token-ca-cert-hash\\s*(\\S+)\\s*$")
-	ar := re.FindStringSubmatch(in)
-	fmt.Printf("+%q\n", ar)
-	if len(ar) == 3 {
-		return ar[1], ar[2]
-	}
-	return "", ""
 }
 
 func (r *ReconcileCluster) ensureAdminConf(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
@@ -265,10 +270,11 @@ func (r *ReconcileCluster) ensureAdminConf(cluster *kubeadmv1alpha1.Cluster, upd
 				Path: "/etc/kubernetes/admin.conf",
 				Requires: &resourcesv1alpha1.Requires{{
 					Command: &resourcesv1alpha1.RequireCommand{
-						Name: cluster.Name + "-" + "kubeadm-init"},
+						Name: nameForKubeadmInitCommand(cluster)},
 				}},
 			},
 		}
+		_ = controllerutil.SetControllerReference(cluster, fc, r.scheme)
 		if err := r.client.Create(context.TODO(), fc); err != nil {
 			return err
 		}
@@ -284,8 +290,12 @@ func (r *ReconcileCluster) ensureAdminConf(cluster *kubeadmv1alpha1.Cluster, upd
 	return nil
 }
 
+func nameForKubeadmInitCommand(cluster *kubeadmv1alpha1.Cluster) string {
+	return cluster.Name + "-kubeadm-" + cluster.Spec.Controllers[0].Name
+}
+
 func (r *ReconcileCluster) runKubeadmOnFirstController(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
-	name := cluster.Name + "-kubeadmin-" + cluster.Spec.Controllers[0].Name
+	name := nameForKubeadmInitCommand(cluster)
 	cmd := &resourcesv1alpha1.FileContent{}
 	err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: name}, cmd)
 	if err != nil && !errors.IsNotFound(err) {
@@ -299,13 +309,14 @@ func (r *ReconcileCluster) runKubeadmOnFirstController(cluster *kubeadmv1alpha1.
 			},
 			Spec: resourcesv1alpha1.CommandSpec{
 				Host:    cluster.Spec.Controllers[0].Name,
-				Command: "kubeadm init --config=/root/kubeadm-config.yaml",
+				Command: "kubeadm init --config=/root/kubeadm-config.yaml --ignore-preflight-errors=all",
 				Requires: &resourcesv1alpha1.Requires{{
 					File: &resourcesv1alpha1.RequireFile{
-						Name: cluster.Name + "-adminconf"},
+						Name: nameForKubeadmConfigFile(cluster)},
 				}},
 			},
 		}
+		_ = controllerutil.SetControllerReference(cluster, fc, r.scheme)
 		if err := r.client.Create(context.TODO(), fc); err != nil && !errors.IsAlreadyExists(err) { // TODO: ?!
 			return err
 		}
@@ -357,10 +368,12 @@ func (r *ReconcileCluster) ensurePKIStatus(cluster *kubeadmv1alpha1.Cluster, upd
 					Path: pkifiles[k],
 					Requires: &resourcesv1alpha1.Requires{{
 						Command: &resourcesv1alpha1.RequireCommand{
-							Name: cluster.Name + "-" + "kubeadm-init"},
+							Name: nameForKubeadmInitCommand(cluster)},
 					}},
 				},
 			}
+			_ = controllerutil.SetControllerReference(cluster, fc, r.scheme) // cannot fail
+
 			if err := r.client.Create(context.TODO(), fc); err != nil {
 				return err
 			}
@@ -374,5 +387,69 @@ func (r *ReconcileCluster) ensurePKIStatus(cluster *kubeadmv1alpha1.Cluster, upd
 		}
 	}
 
+	return nil
+}
+
+func ParseKubeadmOutput(in string) (string, string) {
+	re := regexp.MustCompile("--token (\\S+)\\s*--discovery-token-ca-cert-hash\\s*(\\S+)\\s*$")
+	ar := re.FindStringSubmatch(in)
+	if len(ar) == 3 {
+		return ar[1], ar[2]
+	}
+	return "", ""
+}
+
+func (r *ReconcileCluster) ensureTokenStatus(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+	cmd := &resourcesv1alpha1.Command{}
+	err := r.client.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: nameForKubeadmInitCommand(cluster)}, cmd)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		} else {
+			return pkgerrors.Wrap(err, "could not get command")
+		}
+	}
+
+	if !cmd.Status.Done {
+		return nil
+	}
+
+	token, hash := ParseKubeadmOutput(cmd.Status.Stdout)
+	if token == "" || hash == "" {
+		return nil // not ready
+	}
+
+	cluster.Status.JoinToken = token
+	cluster.Status.DiscoveryTokenCACertHash = hash
+	*update = true
+
+	return nil
+}
+
+func nameForNetworking(cluster *kubeadmv1alpha1.Cluster) string {
+	return cluster.Name + "-networking"
+}
+
+func (r *ReconcileCluster) ensureNetworking(cluster *kubeadmv1alpha1.Cluster, update *bool) error {
+	name := nameForNetworking(cluster)
+	cmd := &resourcesv1alpha1.Command{ObjectMeta: metav1.ObjectMeta{Namespace: cluster.Namespace, Name: name}}
+	op, err := controllerutil.CreateOrUpdate(context.TODO(), r.client, cmd, func(e runtime.Object) error {
+		cmd := e.(*resourcesv1alpha1.Command)
+		if cmd.CreationTimestamp.IsZero() {
+			_ = controllerutil.SetControllerReference(cluster, cmd, r.scheme)
+		}
+		cmd.Spec.Host = cluster.Spec.Controllers[0].Name
+		cmd.Spec.Command = `KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f https://cloud.weave.works/k8s/v1.10/net.yaml`
+		cmd.Spec.Requires = &resourcesv1alpha1.Requires{{
+			Command: &resourcesv1alpha1.RequireCommand{
+				Name: nameForKubeadmInitCommand(cluster)}}}
+		return nil
+	})
+	if err != nil {
+		return pkgerrors.Wrapf(err, "could not reconcile file %s/%s", cluster.Namespace, name)
+	}
+	if op != controllerutil.OperationResultNone {
+		log.Info(fmt.Sprintf("reconciled File %s/%s operation %s", cluster.Namespace, name, op))
+	}
 	return nil
 }
